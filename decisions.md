@@ -230,3 +230,82 @@ uses 4 steps (about 1 page over the catch-up point); the deep pass uses 40.
 
 Hourly launchd run, newest first, early stop after 60 consecutive known ids; weekly deep pass; a missed run
 while the lid is closed catches up on wake. The UI shows "last synced" and marks stale data.
+
+---
+
+## D16 — Tool routing: exact matches must not come from vectors — CRITICAL, open
+
+Recorded from a real failure. The owner asked **"all posts by Ben Dicken"** and got a page of unrelated
+people. This is the most damaging class of bug in the product: a confident, wrong answer about the owner's
+own data. It is critical, not cosmetic.
+
+### What actually happened (measured, not guessed)
+
+```
+SELECT handle, author, COUNT(*) FROM posts GROUP BY handle ORDER BY 3 DESC LIMIT 3;
+  BenjDicken      Ben Dicken      7
+  TheAhmadOsman   Ahmad           5
+  philipkiely     Philip Kiely    4
+
+SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH 'Ben Dicken';   -- 0
+SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH 'BenjDicken';   -- 7
+SELECT COUNT(*) FROM posts WHERE author LIKE '%Ben Dicken%';         -- 7
+```
+
+- The display name lives in `posts.author` ("Ben Dicken"); the handle is `BenjDicken`.
+- FTS5 is indexed on `(text, handle)`. "Ben Dicken" is a **phrase of two tokens that appears in neither
+  column**, so BM25 returns **0**.
+- `search_bookmarks` with a BM25 score of 0 falls through to the D-documented **vector fallback**
+  ("nearest by meaning"). bge-m3 then returns whatever is semantically close to the string, which is
+  unrelated people. The label said "nearest by meaning", so it was honest — and still useless.
+
+### The lesson, and it changes how we build
+
+**The model cannot choose a capability that does not exist.** `search_bookmarks` has exactly two
+parameters, `query` and `limit`. There is no author filter, no date filter, no language filter. The model
+had no correct call available. It followed the tool description and took the only path that returned rows.
+
+So routing quality is not a prompt problem first. It is, in this order:
+
+1. **Affordances** — a tool that can express the question ("posts by this author") returns exact rows.
+2. **Rules** — the prompt says which tool wins for which shape of question, and when to stop.
+3. **Stop conditions** — a tool that returns exact matches must end the search; no second speculative call.
+4. **Evals** — every failure like this one becomes a fixed case, replayed on each change.
+
+Prompt-only fixes ("be careful with vector search") lose to a schema that cannot represent the query.
+
+### Known failure shapes (each needs an owner decision)
+
+| Shape | Example | Should use | Today |
+| --- | --- | --- | --- |
+| Exact author | "all posts by Ben Dicken" | author filter | falls to vector, wrong people |
+| Listing | "show me everything about X" | keyword + author/date scope | ok-ish |
+| Count / aggregate | "how many did I save in November" | `sql_query` | ok |
+| Conceptual | "posts about the hard parts of scaling" | vector, then hybrid | ok |
+| One known post | "what does the Varnan post say" | `get_bookmark` | ok, after a search |
+| Negation / absence | "did I save anything about Zig" | must be allowed to say no | vector always returns rows |
+
+### Proposed fix, in cost order (decision needed)
+
+- **A. Filters on `search_bookmarks`** — `author`, `since`, `until`, `language`. When `author` is set,
+  resolve it with `author LIKE` / `handle LIKE` **before** any vector work, and do not fall back to
+  vectors on a zero-score BM25 in that mode. Vectorize has no metadata filters, so a filtered vector
+  pass would need post-filtering and would silently shrink the candidate set. Cheapest fix that makes
+  the failing query return 7 exact rows.
+- **B. Prompt routing rules** — a short table: author, date, count, listing and conceptual questions,
+  each mapped to one tool; "if a tool returns exact rows, stop"; "vector results are candidates, never
+  proof". Only meaningful after A; alone it changes nothing.
+- **C. Deterministic pre-router** — a regex pass before the model for the patterns that keep failing
+  (`by @handle`, `posts from <month>`, `how many`). Fast and predictable, but it hides routing from the
+  model and grows into a second rule engine. Defer until A and B are measured.
+- **D. Planner call** — a cheap model emits `{tool, args}` first, then the executor runs. Adds a round
+  trip (~1-2 s) and a second model to keep in sync. Not recommended: the main model already plans, it
+  just lacked the filter.
+
+**Recommendation: A, then B, then measure. C only if failures persist. D rejected.**
+
+### Acceptance test for this entry
+
+"All posts by Ben Dicken" must return exactly the 7 posts with `handle = 'BenjDicken'`, with no vector
+call in the trace. Add it to a routing eval set (queries + expected tool + expected row ids) that runs
+before each deploy.
