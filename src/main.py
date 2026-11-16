@@ -357,7 +357,11 @@ def linkify(text) -> Markup:
         tail = url[len(trimmed) :]
         return f'<a href="{trimmed}" target="_blank" rel="noreferrer">{trimmed}</a>{tail}'
 
-    return Markup(URL_PATTERN.sub(replace, escaped))
+    linked = URL_PATTERN.sub(replace, escaped)
+    # The model writes light markdown; render the two forms it actually uses.
+    linked = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", linked)
+    linked = re.sub(r"`([^`]+)`", r"<code>\1</code>", linked)
+    return Markup(linked)
 
 
 def fts_query(raw: str) -> str:
@@ -667,7 +671,8 @@ SYSTEM_PROMPT = (
     "2. Answer only from tool output. Every claim carries the post number in square brackets, like [2].\n"
     "3. Never invent a post, a link, a number or an id.\n"
     "4. If the tools return nothing useful, say so in one line and name a better search phrase.\n"
-    "5. Be short: three sentences at most, then the citations."
+    "5. Be short: three sentences at most, then the citations.\n"
+    "6. No markdown headings and no separate citations or sources list: the interface already shows the posts."
 )
 
 TOOL_SCHEMAS = [
@@ -990,6 +995,14 @@ async def create_conversation(db, title: str) -> dict:
 async def chat_page(request: Request, c: str = "", new: int = 0):
     db = env_of(request).DB
     conversation = None
+    if new:
+        # Reuse an unused chat instead of piling up empty "New chat" rows.
+        conversation = await fetch_one(
+            db,
+            """SELECT c.id, c.title FROM conversations c
+               WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
+               ORDER BY c.updated_at DESC LIMIT 1""",
+        )
     if not new and c:
         conversation = await fetch_one(db, "SELECT id, title FROM conversations WHERE id = ?", (c,))
     if conversation is None and not new:
@@ -1138,19 +1151,19 @@ async def chat_stream(request: Request):
                         db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").bind(now, conversation["id"]),
                     ]
                 )
+                # Only the assistant bubble: the page already added the user message optimistically.
                 fragment = await render(
                     request,
                     "partials/messages.html",
                     {
                         "messages": [
-                            {"role": "user", "content": question, "sources": []},
                             {
                                 "role": "assistant",
                                 "content": answer,
                                 "sources": slim,
                                 "model": model,
                                 "trace": trace,
-                            },
+                            }
                         ]
                     },
                 )
