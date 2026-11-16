@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hourly bookmark sync.
+  Install:
+    sed -e "s|__REPO__|$HOME/Codebase/twitter-bookmarks|g" \
+        -e "s|__API__|https://twitter-bookmarks.YOUR-SUBDOMAIN.workers.dev|g" \
+        launchd/com.umaralikhan.twitter-bookmarks.sync.plist \
+        > ~/Library/LaunchAgents/com.umaralikhan.twitter-bookmarks.sync.plist
+    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.umaralikhan.twitter-bookmarks.sync.plist 2>/dev/null
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.umaralikhan.twitter-bookmarks.sync.plist
+  Check:
+    launchctl print gui/$(id -u)/com.umaralikhan.twitter-bookmarks.sync | head -20
+    tail -20 ~/Library/Logs/twitter-bookmarks-sync.log
+  Remove:
+    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.umaralikhan.twitter-bookmarks.sync.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.umaralikhan.twitter-bookmarks.sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>__REPO__/agent/sync.py</string>
+    <string>--max-pages</string>
+    <string>4</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TB_API</key>
+    <string>__API__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin</string>
+  </dict>
+
+  <!-- Hourly. A run missed while the lid is closed starts when the Mac wakes. -->
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/twitter-bookmarks-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/twitter-bookmarks-sync.log</string>
+
+  <!-- browse drives the real Chrome, so this job must happen in the user's session. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

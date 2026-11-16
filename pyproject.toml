@@ -1,0 +1,16 @@
+[project]
+name = "twitter-bookmarks"
+version = "0.1.0"
+description = "Index your X bookmarks into D1 and search them"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi",
+    "jinja2",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+    "pytest",
+]

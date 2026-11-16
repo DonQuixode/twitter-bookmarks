@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block subtitle %}chat over your bookmarks{% endblock %}
+{% block content %}
+  <div class="chat">
+    <aside class="convs">
+      <a class="new" href="/chat?new=1">+ New chat</a>
+      {% for item in conversations %}
+        <a href="/chat?c={{ item.id }}" class="{{ 'active' if item.id == conversation.id else '' }}">{{ item.title }}</a>
+      {% endfor %}
+    </aside>
+
+    <section class="thread">
+      <div id="messages">
+        {% if not messages %}
+          <p class="empty">Ask about anything you saved. Answers cite the bookmarks they use.</p>
+        {% endif %}
+        {% include "partials/messages.html" %}
+      </div>
+
+      <form
+        class="composer"
+        hx-post="/chat"
+        hx-target="#messages"
+        hx-swap="beforeend"
+        hx-indicator="#thinking"
+        hx-on::after-request="this.reset(); document.getElementById('messages').lastElementChild?.scrollIntoView({block:'end'})"
+      >
+        <input type="hidden" name="conversation" value="{{ conversation.id }}" />
+        <textarea name="message" rows="2" placeholder="What should I read about Postgres caching?" required></textarea>
+        <button type="submit">Send</button>
+        <span id="thinking" class="hint htmx-indicator">Thinking…</span>
+      </form>
+    </section>
+  </div>
+{% endblock %}

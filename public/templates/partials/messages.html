@@ -1,0 +1,29 @@
+{% for message in messages %}
+  <article class="msg {{ message.role }}">
+    <p class="who">
+      {{ "You" if message.role == "user" else "Assistant" }}
+      {% if message.model %}<span class="model">{{ message.model }}</span>{% endif %}
+    </p>
+    <div class="body">{{ message.content }}</div>
+    {% if message.trace %}
+      <details class="trace">
+        <summary>{{ message.trace|length }} tool call{% if message.trace|length != 1 %}s{% endif %}</summary>
+        <ul>
+          {% for step in message.trace %}
+            <li><code>{{ step.tool }}</code> {{ step.args }} — {{ step.result }}</li>
+          {% endfor %}
+        </ul>
+      </details>
+    {% endif %}
+    {% if message.problems %}
+      <p class="error">{% for problem in message.problems %}{{ problem }}<br />{% endfor %}</p>
+    {% endif %}
+    {% if message.sources %}
+      <div class="sources">
+        {% for source in message.sources %}
+          <a href="{{ source.url }}" target="_blank" rel="noreferrer">[{{ source.n or loop.index }}] @{{ source.handle or "unknown" }}{% if source.posted_at %} · {{ source.posted_at[:10] }}{% endif %}</a>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </article>
+{% endfor %}

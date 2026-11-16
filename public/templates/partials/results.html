@@ -1,0 +1,20 @@
+{% if rows %}
+  {% if q and used == "vector" %}<p class="hint">Nothing matched closely. These are the nearest by meaning.</p>{% endif %}
+  {% for row in rows %}
+    <article class="row">
+      <p>{{ row.text }}</p>
+      <p class="meta">
+        <a href="{{ row.url }}" target="_blank" rel="noreferrer">@{{ row.handle or "unknown" }}</a>
+        {% if row.posted_at %} · {{ row.posted_at[:10] }}{% endif %}
+      </p>
+    </article>
+  {% endfor %}
+{% else %}
+  <p class="empty">
+    {% if q %}
+      Nothing matched "{{ q }}", by keywords or by meaning.
+    {% else %}
+      No bookmarks yet. Run the sync agent, or POST to <code>/ingest</code>.
+    {% endif %}
+  </p>
+{% endif %}

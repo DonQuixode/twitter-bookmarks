@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+  <p class="meta">
+    {{ total }} bookmark{% if total != 1 %}s{% endif %} indexed
+    {% if pending %} · {{ pending }} waiting for embeddings
+      <button hx-post="/reindex" hx-target="#reindex-out" hx-swap="innerHTML">Embed now</button>
+      <span id="reindex-out"></span>
+    {% endif %}
+  </p>
+  <input
+    type="search"
+    name="q"
+    placeholder="Search text, handles, topics..."
+    autocomplete="off"
+    hx-get="/search"
+    hx-target="#results"
+    hx-trigger="input changed delay:250ms, search"
+    hx-swap="innerHTML"
+  />
+  <section id="results">{% include "partials/results.html" %}</section>
+{% endblock %}
