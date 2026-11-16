@@ -233,79 +233,82 @@ while the lid is closed catches up on wake. The UI shows "last synced" and marks
 
 ---
 
-## D16 — Tool routing: exact matches must not come from vectors — CRITICAL, open
+## D16 — Tool discipline: stop when the answer is in hand — CRITICAL, open
 
-Recorded from a real failure. The owner asked **"all posts by Ben Dicken"** and got a page of unrelated
-people. This is the most damaging class of bug in the product: a confident, wrong answer about the owner's
-own data. It is critical, not cosmetic.
+Recorded from a real failure. The owner asked **"can you give me all posts by Ben Dicken?"** and got
+unrelated people in the citations. This is the most damaging class of bug in the product: a confident,
+wrong answer about the owner's own data. It is critical, not cosmetic.
 
-### What actually happened (measured, not guessed)
+### Correction to the first diagnosis
+
+The first reading of this failure was "the tool cannot express the question". **That was wrong**, and the
+stored traces prove it. `sql_query` reaches the whole schema. The model used it correctly.
+
+### What actually happened (from `messages.tool_trace` in production)
 
 ```
-SELECT handle, author, COUNT(*) FROM posts GROUP BY handle ORDER BY 3 DESC LIMIT 3;
-  BenjDicken      Ben Dicken      7
-  TheAhmadOsman   Ahmad           5
-  philipkiely     Philip Kiely    4
+Q: can you give me all posts by Ben Dicken?
+  1. sql_query  {SELECT id, handle, author, substr(text,1,120) FROM posts
+                 WHERE author LIKE '%Dicken%' OR handle LIKE '%dicken%'}
+     -> 7 rows                                    exact rows, correct answer
+  2. search_bookmarks {"query": "Ben Dicken", "limit": 20}
+     -> 20 posts via vector                       unrelated people, not needed
+  answer cites rows from call 2
 
-SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH 'Ben Dicken';   -- 0
-SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH 'BenjDicken';   -- 7
-SELECT COUNT(*) FROM posts WHERE author LIKE '%Ben Dicken%';         -- 7
+Q: all posts by @BenjDicken
+  1. sql_query  {SELECT handle, author, COUNT(*) ... WHERE LOWER(author) LIKE '%dicken%'}
+     -> 1 row
+  2. search_bookmarks {"query": "Ben Dicken", "limit": 15} -> 15 posts via vector
+  3. sql_query  {SELECT id, posted_at, text FROM posts WHERE handle='BenjDicken'}
+     -> 7 rows
 ```
 
-- The display name lives in `posts.author` ("Ben Dicken"); the handle is `BenjDicken`.
-- FTS5 is indexed on `(text, handle)`. "Ben Dicken" is a **phrase of two tokens that appears in neither
-  column**, so BM25 returns **0**.
-- `search_bookmarks` with a BM25 score of 0 falls through to the D-documented **vector fallback**
-  ("nearest by meaning"). bge-m3 then returns whatever is semantically close to the string, which is
-  unrelated people. The label said "nearest by meaning", so it was honest — and still useless.
+Three observed facts:
 
-### The lesson, and it changes how we build
+1. **The model ran a second search it did not need.** Call 1 already answered the question.
+2. **The vector call returned rows for a query that has no meaning component.** "Ben Dicken" is a name;
+   BM25 scores 0, the fallback fires, bge-m3 returns neighbours by meaning, and those rows are noise.
+3. **Noise entered the citation registry.** The `[n]` numbers are assigned across all tool results in the
+   turn, so rows from call 2 sat next to rows from call 1 with equal standing. The model cited them.
 
-**The model cannot choose a capability that does not exist.** `search_bookmarks` has exactly two
-parameters, `query` and `limit`. There is no author filter, no date filter, no language filter. The model
-had no correct call available. It followed the tool description and took the only path that returned rows.
+### The lesson
 
-So routing quality is not a prompt problem first. It is, in this order:
+**Capability was never the problem. Discipline was.** The prompt says *"search_bookmarks: start here for
+topic questions"* and the model obeys that habit even after an exact result set is on the table. Nothing
+in the code, the prompt, or the result text said *"you already have the answer, stop"*, and nothing marked
+the vector rows as approximations.
 
-1. **Affordances** — a tool that can express the question ("posts by this author") returns exact rows.
-2. **Rules** — the prompt says which tool wins for which shape of question, and when to stop.
-3. **Stop conditions** — a tool that returns exact matches must end the search; no second speculative call.
-4. **Evals** — every failure like this one becomes a fixed case, replayed on each change.
+So the fix is not a schema change. It is, in order:
 
-Prompt-only fixes ("be careful with vector search") lose to a schema that cannot represent the query.
+1. **A stop rule the code enforces.** If a tool returns rows that satisfy an exact constraint, the next
+   round must not offer search tools at all. Prompt rules are advisory; the tool list is not.
+2. **Result text that states its own authority.** `"7 rows (exact match on author)"` versus
+   `"15 approximate neighbours by meaning — not matches, do not cite as the answer."`
+3. **A prompt rule to match.** "One good call is enough. If the result answers the question, answer."
+4. **Citation scoping.** The model must cite only rows from the call that produced its answer.
 
-### Known failure shapes (each needs an owner decision)
+### Known failure shapes
 
-| Shape | Example | Should use | Today |
+| Shape | Example | Correct path | Observed |
 | --- | --- | --- | --- |
-| Exact author | "all posts by Ben Dicken" | author filter | falls to vector, wrong people |
-| Listing | "show me everything about X" | keyword + author/date scope | ok-ish |
-| Count / aggregate | "how many did I save in November" | `sql_query` | ok |
-| Conceptual | "posts about the hard parts of scaling" | vector, then hybrid | ok |
-| One known post | "what does the Varnan post say" | `get_bookmark` | ok, after a search |
+| Exact author | "all posts by Ben Dicken" | `sql_query`, then stop | correct SQL, then a needless vector call, then cites the noise |
+| Count / aggregate | "how many in November" | `sql_query` | ok |
+| Listing | "show me everything about X" | hybrid | ok |
+| Conceptual | "posts about scaling pain" | vector, then hybrid | ok |
+| One known post | "what does the Varnan post say" | `get_bookmark` | ok |
 | Negation / absence | "did I save anything about Zig" | must be allowed to say no | vector always returns rows |
 
-### Proposed fix, in cost order (decision needed)
+### Options considered
 
-- **A. Filters on `search_bookmarks`** — `author`, `since`, `until`, `language`. When `author` is set,
-  resolve it with `author LIKE` / `handle LIKE` **before** any vector work, and do not fall back to
-  vectors on a zero-score BM25 in that mode. Vectorize has no metadata filters, so a filtered vector
-  pass would need post-filtering and would silently shrink the candidate set. Cheapest fix that makes
-  the failing query return 7 exact rows.
-- **B. Prompt routing rules** — a short table: author, date, count, listing and conceptual questions,
-  each mapped to one tool; "if a tool returns exact rows, stop"; "vector results are candidates, never
-  proof". Only meaningful after A; alone it changes nothing.
-- **C. Deterministic pre-router** — a regex pass before the model for the patterns that keep failing
-  (`by @handle`, `posts from <month>`, `how many`). Fast and predictable, but it hides routing from the
-  model and grows into a second rule engine. Defer until A and B are measured.
-- **D. Planner call** — a cheap model emits `{tool, args}` first, then the executor runs. Adds a round
-  trip (~1-2 s) and a second model to keep in sync. Not recommended: the main model already plans, it
-  just lacked the filter.
+- **Enforced stop + result labelling + citation scoping** — recommended. No migration, no new dependency.
+- **Author/date filters on `search_bookmarks`** — still useful for latency and for honest "no result",
+  but **not** required for correctness: SQL already covers it. Demoted from the original proposal.
+- **Deterministic pre-router** (regex on `by @handle`) — defer; becomes a second rule engine.
+- **Planner call** — rejected; adds a round trip to do what one call already did.
 
-**Recommendation: A, then B, then measure. C only if failures persist. D rejected.**
+### Acceptance test
 
-### Acceptance test for this entry
+"All posts by Ben Dicken" must return exactly the 7 rows with `handle='BenjDicken'`, and the trace must
+contain **no** `search_bookmarks` or `vector_search` call after the exact result. Add it, plus the other
+shapes above, to a routing eval set that runs before each deploy.
 
-"All posts by Ben Dicken" must return exactly the 7 posts with `handle = 'BenjDicken'`, with no vector
-call in the trace. Add it to a routing eval set (queries + expected tool + expected row ids) that runs
-before each deploy.
