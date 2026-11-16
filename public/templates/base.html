@@ -31,11 +31,13 @@
       code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
 
       /* chat */
-      .chat { display: grid; grid-template-columns: 190px 1fr; gap: 24px; align-items: start; }
-      .convs { display: grid; gap: 4px; font-size: 14px; position: sticky; top: 16px; }
+      /* minmax(0, 1fr) plus min-width:0 keeps long titles from widening the sidebar track. */
+      .chat { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 24px; align-items: start; }
+      .convs { display: grid; gap: 4px; font-size: 14px; position: sticky; top: 16px; min-width: 0; overflow: hidden; }
       .convs a { color: var(--muted); text-decoration: none; padding: 6px 8px; border-radius: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .conv { display: flex; align-items: center; gap: 2px; }
-      .conv a { flex: 1; min-width: 0; }
+      .conv { display: flex; align-items: center; gap: 2px; min-width: 0; }
+      .conv a { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .conv form { margin: 0; flex: 0 0 auto; }
       .conv.active { background: #f3f4f6; border-radius: 6px; }
       .conv.active a { color: var(--fg); }
       .conv .del { border: 0; background: none; padding: 2px 6px; font-size: 15px; line-height: 1; color: var(--muted); opacity: 0; }
@@ -47,10 +49,12 @@
       .msg.user { background: #f9fafb; }
       .msg .who { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
       .msg .who .model { text-transform: none; letter-spacing: 0; opacity: 0.65; }
-      .msg .body { white-space: pre-wrap; }
+      .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .msg .body a { color: var(--accent); }
       .sources { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-      .sources a { font-size: 12px; color: var(--accent); text-decoration: none; border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
-      .composer { margin-top: 16px; display: grid; gap: 8px; }
+      .sources a { font-size: 12px; color: var(--accent); text-decoration: none; border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .composer { margin-top: 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+      .composer textarea { grid-column: 1 / -1; }
       .composer textarea { width: 100%; font: inherit; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; resize: vertical; }
       .trace { margin-top: 10px; font-size: 12px; color: var(--muted); }
       .trace summary { cursor: pointer; }

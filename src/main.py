@@ -117,7 +117,12 @@ async def render(request: Request, name: str, context: dict, status_code: int = 
         lstrip_blocks=True,
     )
     jinja.filters["linkify"] = linkify
-    return HTMLResponse(jinja.get_template(name).render(**context), status_code=status_code)
+    # no-store: a deploy must never leave an old page in the browser cache.
+    return HTMLResponse(
+        jinja.get_template(name).render(**context),
+        status_code=status_code,
+        headers={"cache-control": "no-store"},
+    )
 
 
 # ---------------------------------------------------------------- auth
