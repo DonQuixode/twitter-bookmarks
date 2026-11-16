@@ -4,7 +4,7 @@
       {{ "You" if message.role == "user" else "Assistant" }}
       {% if message.model %}<span class="model">{{ message.model }}</span>{% endif %}
     </p>
-    <div class="body">{{ message.content }}</div>
+    <div class="body">{{ message.content|linkify }}</div>
     {% if message.trace %}
       <details class="trace">
         <summary>{{ message.trace|length }} tool call{% if message.trace|length != 1 %}s{% endif %}</summary>

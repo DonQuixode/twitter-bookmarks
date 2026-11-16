@@ -10,6 +10,7 @@ Chat: glm-5.3 through OpenCode Go, deepseek-v4.1-flash as fallback, sessions in 
 import base64
 import binascii
 import hashlib
+import html
 import hmac
 import asyncio
 import json
@@ -22,6 +23,7 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from jinja2 import DictLoader, Environment, select_autoescape
+from markupsafe import Markup
 from js import Object, fetch as js_fetch
 from pyodide.ffi import to_js
 from workers import asgi
@@ -49,8 +51,8 @@ HYBRID_VECTOR_FLOOR = 0.45
 RRF_K = 60
 
 GO_BASE = "https://opencode.ai/inference/go/openai/v1"
-CHAT_MODEL = "glm-5.3"
-CHAT_FALLBACK = "deepseek-v4.1-flash"
+CHAT_MODEL = "deepseek-v4.1-flash"
+CHAT_FALLBACK = "glm-5.3"
 CHUNK_CHARS = 1000
 CHUNK_OVERLAP = 200
 VECTOR_TOP_K = 30
@@ -114,6 +116,7 @@ async def render(request: Request, name: str, context: dict, status_code: int = 
         trim_blocks=True,
         lstrip_blocks=True,
     )
+    jinja.filters["linkify"] = linkify
     return HTMLResponse(jinja.get_template(name).render(**context), status_code=status_code)
 
 
@@ -334,6 +337,22 @@ async def embed_posts(env, rows: list[dict]) -> int:
 
 
 # ---------------------------------------------------------------- pages
+
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+
+
+def linkify(text) -> Markup:
+    """Escape, then turn bare URLs into links. Safe because escaping happens first."""
+    escaped = html.escape(str(text or ""))
+
+    def replace(match: re.Match) -> str:
+        url = match.group(0)
+        trimmed = url.rstrip(".,;:!?)]}")
+        tail = url[len(trimmed) :]
+        return f'<a href="{trimmed}" target="_blank" rel="noreferrer">{trimmed}</a>{tail}'
+
+    return Markup(URL_PATTERN.sub(replace, escaped))
 
 
 def fts_query(raw: str) -> str:

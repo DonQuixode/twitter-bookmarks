@@ -66,10 +66,13 @@ Endpoint `https://opencode.ai/inference/go/openai/v1/chat/completions`, key in t
 
 | Setting | Value |
 |---|---|
-| Primary | `glm-5.3` |
-| Fallback | `deepseek-v4.1-flash` (used when the primary errors, is empty, or empties its budget) |
+| Primary | `deepseek-v4.1-flash` |
+| Fallback | `glm-5.3` (used when the primary errors, is empty, or empties its budget) |
 | Context | 1,000,000 tokens each; both declare tool support |
-| Output price | $4.40/M (glm) vs $0.60/M (deepseek) |
+| Output price | $0.60/M (deepseek) vs $4.40/M (glm) |
+
+*Owner's call, 2026-11-17:* deepseek leads because it is 7x cheaper per output token and its answers were
+good in the tool loop; glm stays as the safety net when deepseek errors or returns nothing.
 
 Three API facts that cost debugging time:
 
@@ -189,6 +192,28 @@ removes the dead air.
 *Implementation notes:* `asyncio.Queue` + `asyncio.create_task` with an `emit` callback passed into
 `agent_answer`; `StreamingResponse` does stream from the Workers ASGI adapter (verified with a 4-tick probe).
 Also confirmed: `POST /chat` still answers without JavaScript (stores, then redirects).
+
+## D15 — Save media, and OCR the heavy posts — open (owner's rule, work later)
+
+For every bookmarked post that has media: **save the media**, and **OCR it** when either
+
+- the post has a video, or
+- the post has more than 2 images.
+
+Rationale: a bookmark is worth keeping readable after X deletes the post, and image text (code screenshots,
+slides, charts) is invisible to search today.
+
+*Open questions to settle before building:*
+1. **Where.** R2 bucket (no bucket exists yet); D1 is for text only, 2 MB per row.
+2. **Videos are not OCR.** "OCR a video" needs a frame grab (poster or N frames) before OCR, or a transcript
+   instead. Pick one: poster frame, fixed frames every N seconds, or audio transcription.
+3. **Which images.** Only the `>2 images` posts, or every image? The rule above says every image gets saved,
+   OCR only for the heavy cases.
+4. **Search integration.** OCR text goes into `posts_fts` (as a separate column or appended text) and into the
+   embedding chunks (D11)? If appended, re-embedding is required.
+5. **Retention and size.** Media accumulates without limit; a per-post cap and a total-size budget are needed.
+
+Related: D7 (OCR for media) and D11 (embeddings). This entry supersedes the "leaning" in D7.
 
 ---
 
