@@ -17,3 +17,6 @@ python_modules/
 data/
 *.local
 .DS_Store
+
+# Internal notes: kept local, never published.
+decisions.md
