@@ -136,3 +136,42 @@ def test_non_timeline_bodies_are_rejected():
 def test_iso_date_tolerates_junk():
     assert parse.iso_date("tomorrow") is None
     assert parse.iso_date(None) is None
+
+
+
+def test_verify_password_ignores_trailing_whitespace():
+    """A stray newline in the uploaded secret must not read as 'wrong password'."""
+    import base64
+    import binascii
+    import hashlib
+    import hmac
+    import pathlib
+
+    source = pathlib.Path("src/main.py").read_text()
+    start = source.index("def verify_password")
+    end = source.index("\ndef ", start + 10)
+
+    def unb64(text):
+        return base64.b64decode(text, validate=True)
+
+    def pbkdf2_sha256(password, salt, iterations, length=32):
+        return hashlib.pbkdf2_hmac("sha256", password, salt, iterations, length)
+
+    namespace = {
+        "hmac": hmac,
+        "binascii": binascii,
+        "unb64": unb64,
+        "pbkdf2_sha256": pbkdf2_sha256,
+    }
+    exec(compile(source[start:end], "auth.py", "exec"), namespace)
+    verify = namespace["verify_password"]
+
+    salt = b"0123456789abcdef"
+    digest = hashlib.pbkdf2_hmac("sha256", b"correct horse", salt, 1000, 32)
+    stored = "pbkdf2_sha256$1000${}${}".format(
+        base64.b64encode(salt).decode(), base64.b64encode(digest).decode()
+    )
+
+    assert verify("correct horse", stored)
+    assert verify("correct horse", stored + "\n")
+    assert not verify("wrong horse", stored)

@@ -309,6 +309,72 @@ So the fix is not a schema change. It is, in order:
 ### Acceptance test
 
 "All posts by Ben Dicken" must return exactly the 7 rows with `handle='BenjDicken'`, and the trace must
-contain **no** `search_bookmarks` or `vector_search` call after the exact result. Add it, plus the other
-shapes above, to a routing eval set that runs before each deploy.
+contain **no** `search_bookmarks` or `vector_search` call after the exact result.
 
+**Status: implemented.** See D17 for the authority contract, the prompt rule, and
+`scripts/eval_routing.py`, which passes all four shapes above on the deployed Worker.
+
+
+---
+
+## D17 — Tool results carry their own authority; one prompt rule; an eval set — done
+
+Implements the chosen fix for D16. No migration, no new dependency.
+
+**The contract.** Every tool result now reports three fields:
+
+| Tool | `authority` | `complete` | `citable` |
+| --- | --- | --- | --- |
+| `sql_query` (under the 50-row cap) | `exact` | `true` | `true` |
+| `sql_query` (capped) | `exact` | `false` | `true` |
+| `get_bookmark` | `exact` | `true` | `true` |
+| `search_bookmarks` (hybrid) | `ranked` | `false` | `true` |
+| `vector_search` | `approximate` | `false` | **`false`** |
+
+**The rule** (prompt rule 2): `authority=exact` with `complete=true` means you have the whole answer — answer
+now and do not search again; a `ranked` or `approximate` result is a candidate list; never cite
+`citable=false`.
+
+**Why information and not a ban.** The model reasoned correctly about *which* call to make — both traces
+open with the right `sql_query`. What it could not know was whether the result set was complete. That fact
+belongs to the tool, not to the model. Give the fact, keep the judgment.
+
+**Measured** (`scripts/eval_routing.py`, 4 cases, deployed Worker):
+
+```
+[pass] exact author listing   sql_query                              -> 7 rows (exact, complete), no vector call
+[pass] count by month         sql_query -> sql_query -> sql_query    -> correct total
+[pass] read one known post    search_bookmarks -> sql_query          -> correct post
+[pass] absence is allowed     search_bookmarks -> vector_search      -> "Nothing specific on the borrow checker"
+```
+
+The fourth case is the control: there `vector_search` **should** run, because hybrid returned
+`ranked, partial`. The model continued searching and still refused to invent an answer.
+
+**Harness.** `POST /eval/ask` takes `{"question": ...}`, is guarded by `INGEST_TOKEN`, calls the same
+`agent_answer` loop, writes nothing to D1, and returns the tool trace. It is in `PUBLIC_PATHS` because it
+carries its own bearer check, and the session middleware would otherwise redirect it to `/login`.
+`python3 scripts/eval_routing.py` runs the four cases and fails on a bad tool sequence, not only on a bad
+answer. Run it before each deploy.
+
+**Still open:** `sql_query` ran three times on the count question. Correct, but wasteful; the round cap
+of 3 is the only limit. A later refinement.
+
+---
+
+## D18 — Production login is broken; the hash no longer matches the password file — CRITICAL, needs owner
+
+Found while wiring the eval. `POST /login` returns **401 "Wrong password."** for the password in
+`~/.config/twitter-bookmarks/app-password`. The dev password `testpw` also returns 401, so the deployed
+hash is not the `.dev.vars` value either. Existing browser sessions still work, because a signed cookie
+from an earlier login stays valid for 30 days.
+
+Consequence: the app is unusable from any new browser or device until the hash is corrected.
+
+- The stored hash is write-only, so it cannot be read back and compared.
+- Defensive fix already in: `verify_password` strips surrounding whitespace, so a secret uploaded with a
+  trailing newline can no longer masquerade as a wrong password. Covered by a test.
+- Remaining fix needs the owner: re-upload a hash of the current password, or set a new password.
+
+This is the second time a secret upload has silently broken login (see the empty-hash incident). A
+post-deploy login smoke test belongs in the same script as the routing eval.

@@ -42,7 +42,7 @@ _template_cache: dict[str, str] = {}
 
 SESSION_COOKIE = "tb_session"
 SESSION_SECONDS = 30 * 24 * 3600
-PUBLIC_PATHS = {"/login", "/logout", "/ingest", "/health", "/htmx.min.js"}
+PUBLIC_PATHS = {"/login", "/logout", "/ingest", "/eval/ask", "/health", "/htmx.min.js"}
 
 EMBED_MODEL = "@cf/baai/bge-m3"
 VECTOR_DIMS = 1024
@@ -160,6 +160,8 @@ def pbkdf2_sha256(password: bytes, salt: bytes, iterations: int, length: int = 3
 
 def verify_password(password: str, stored: str) -> bool:
     """stored = pbkdf2_sha256$<iterations>$<salt b64>$<hash b64>"""
+    # A stray newline from a secret upload must not turn into "wrong password".
+    stored = (stored or "").strip()
     try:
         algorithm, iterations, salt_b64, hash_b64 = stored.split("$")
     except ValueError:
@@ -668,11 +670,14 @@ SYSTEM_PROMPT = (
     "- get_bookmark: one post in full, by id.\n"
     "Rules:\n"
     "1. Call at most 3 tools before answering. Do not repeat the same call.\n"
-    "2. Answer only from tool output. Every claim carries the post number in square brackets, like [2].\n"
-    "3. Never invent a post, a link, a number or an id.\n"
-    "4. If the tools return nothing useful, say so in one line and name a better search phrase.\n"
-    "5. Be short: three sentences at most, then the citations.\n"
-    "6. No markdown headings and no separate citations or sources list: the interface already shows the posts."
+    "2. Every result reports authority and complete. authority=exact with complete=true means you already\n"
+    "   have the whole answer: answer now and do not search again. authority=ranked or approximate is a\n"
+    "   candidate list, so a different query may help. Never cite rows marked citable=false.\n"
+    "3. Answer only from tool output. Every claim carries the post number in square brackets, like [2].\n"
+    "4. Never invent a post, a link, a number or an id.\n"
+    "5. If the tools return nothing useful, say so in one line and name a better search phrase.\n"
+    "6. Be short: three sentences at most, then the citations.\n"
+    "7. No markdown headings and no separate citations or sources list: the interface already shows the posts."
 )
 
 TOOL_SCHEMAS = [
@@ -810,14 +815,42 @@ async def tool_search(env, args: dict, registry: dict, mode: str) -> dict:
     else:
         rows, used = await hybrid_search(env, query)
     posts = register(rows, registry, limit)
-    return {"used": used, "count": len(posts), "posts": posts}
+    if mode == "vector":
+        return {
+            "used": "vector",
+            "count": len(posts),
+            "posts": posts,
+            # No keyword evidence behind these rows. The model must not treat them as proof.
+            "authority": "approximate",
+            "complete": False,
+            "citable": False,
+            "note": "Nearest neighbours by meaning only. Not matches. Do not cite these as the answer.",
+        }
+    return {
+        "used": used,
+        "count": len(posts),
+        "posts": posts,
+        "authority": "ranked",
+        "complete": False,
+        "citable": True,
+        "note": "Top ranked matches, not the full set. A different query may find more.",
+    }
 
 
 async def tool_sql(env, args: dict) -> dict:
     statement = sql_guard(str(args.get("sql") or ""))
     rows = await fetch_all(env.DB, statement)
     trimmed = [trim_row(row) for row in rows[:50]]
-    return {"row_count": len(rows), "rows": trimmed, "truncated": len(rows) > 50}
+    truncated = len(rows) > 50
+    return {
+        "row_count": len(rows),
+        "rows": trimmed,
+        "truncated": truncated,
+        "authority": "exact",
+        "complete": not truncated,
+        "citable": True,
+        "note": "Every row the query matched." if not truncated else "Capped at 50 rows: there is more.",
+    }
 
 
 async def tool_get(env, args: dict, registry: dict) -> dict:
@@ -832,7 +865,14 @@ async def tool_get(env, args: dict, registry: dict) -> dict:
     if not row:
         return {"found": False, "id": post_id}
     item = register([row], registry, 1)[0]
-    return {"found": True, "post": {**item, "author": row.get("author"), "url": row.get("url")}}
+    return {
+        "found": True,
+        "post": {**item, "author": row.get("author"), "url": row.get("url")},
+        "authority": "exact",
+        "complete": True,
+        "citable": True,
+        "note": "The full stored text of this post.",
+    }
 
 
 async def run_tool(env, name: str, args: dict, registry: dict) -> dict:
@@ -849,10 +889,12 @@ async def run_tool(env, name: str, args: dict, registry: dict) -> dict:
 
 def preview(result) -> str:
     if isinstance(result, dict):
+        authority = result.get("authority", "")
+        complete = "complete" if result.get("complete") else "partial"
         if "posts" in result:
-            return f"{result.get('count', 0)} posts via {result.get('used')}"
+            return f"{result.get('count', 0)} posts via {result.get('used')} ({authority}, {complete})"
         if "row_count" in result:
-            return f"{result['row_count']} rows"
+            return f"{result['row_count']} rows ({authority}, {complete})"
         if "found" in result:
             return "found" if result["found"] else "not found"
         if "error" in result:
@@ -1089,6 +1131,33 @@ async def chat_send(request: Request):
     return RedirectResponse(f"/chat?c={conversation['id']}", status_code=303)
 
 
+@app.post("/eval/ask")
+async def eval_ask(request: Request):
+    """Tool-routing eval: bearer token, no session, no database writes.
+
+    Returns the answer plus the tool trace, so a test can assert WHICH tools ran.
+    """
+    env = env_of(request)
+    token = secret_of(request, "INGEST_TOKEN")
+    if not token or request.headers.get("authorization", "") != f"Bearer {token}":
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        payload = json.loads((await request.body()) or b"{}")
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+    answer, sources, used, model, trace = await agent_answer(env, question, "tb-eval")
+    return {
+        "answer": answer,
+        "model": model,
+        "used": used,
+        "tools": trace,
+        "sources": len(sources),
+    }
+
+
 @app.post("/chat/stream")
 async def chat_stream(request: Request):
     """Same loop as /chat, but the browser sees progress as it happens (Server-Sent Events)."""
@@ -1126,6 +1195,7 @@ async def chat_stream(request: Request):
 
         async def work() -> None:
             try:
+                await emit("start", {"conversation": conversation["id"]})
                 answer, sources, used, model, trace = await agent_answer(
                     env, question, f"tb-{conversation['id']}", emit
                 )
