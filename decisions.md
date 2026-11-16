@@ -167,6 +167,29 @@ the UI. Only cited posts are shown as chips.
 **Trace:** each answer stores `tool_trace` (tool, arguments, result summary) and renders it in a collapsed
 `<details>` block. When an answer is wrong, you can see why.
 
+## D14 — Progress streaming: SSE events, not tokens — decided, shipped
+
+`POST /chat/stream` returns `text/event-stream`. The browser reads it with `fetch` + `TextDecoder` and swaps the
+pending bubble when the answer arrives.
+
+| Event | Payload |
+|---|---|
+| `status` | "Searching your bookmarks..." |
+| `tool` | "Running sql_query..." |
+| `answer` | the rendered HTML for the user + assistant messages |
+| `error` | a short message, never a hang |
+
+Measured on the live Worker: status at 1 s, tool at 11 s, answer at 16 s. Before streaming the first visible
+pixel was at 16 s.
+
+*Why events and not tokens:* the loop waits on tool calls, and glm-5.3 emits reasoning tokens before content.
+Streaming raw deltas would show the model thinking about SQL, not the answer. Event-level progress is what
+removes the dead air.
+
+*Implementation notes:* `asyncio.Queue` + `asyncio.create_task` with an `emit` callback passed into
+`agent_answer`; `StreamingResponse` does stream from the Workers ASGI adapter (verified with a 4-tick probe).
+Also confirmed: `POST /chat` still answers without JavaScript (stores, then redirects).
+
 ---
 
 ## D12 — Capture walk policy — open, informed by the spike

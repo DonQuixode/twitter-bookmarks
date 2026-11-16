@@ -34,7 +34,13 @@
       .chat { display: grid; grid-template-columns: 190px 1fr; gap: 24px; align-items: start; }
       .convs { display: grid; gap: 4px; font-size: 14px; position: sticky; top: 16px; }
       .convs a { color: var(--muted); text-decoration: none; padding: 6px 8px; border-radius: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .convs a.active { background: #f3f4f6; color: var(--fg); }
+      .conv { display: flex; align-items: center; gap: 2px; }
+      .conv a { flex: 1; min-width: 0; }
+      .conv.active { background: #f3f4f6; border-radius: 6px; }
+      .conv.active a { color: var(--fg); }
+      .conv .del { border: 0; background: none; padding: 2px 6px; font-size: 15px; line-height: 1; color: var(--muted); opacity: 0; }
+      .conv:hover .del, .conv.active .del { opacity: 1; }
+      .conv .del:hover { color: #b91c1c; background: none; }
       .convs .new { color: var(--accent); font-weight: 600; }
       #messages { display: grid; gap: 14px; }
       .msg { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }

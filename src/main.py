@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import asyncio
 import json
 import re
 import time
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from jinja2 import DictLoader, Environment, select_autoescape
 from js import Object, fetch as js_fetch
 from pyodide.ffi import to_js
@@ -565,6 +566,18 @@ async def ingest(request: Request):
     return answer
 
 
+@app.get("/debug/stream")
+async def debug_stream():
+    """Temporary: proves whether SSE chunks leave the Worker before the handler finishes."""
+
+    async def events():
+        for index in range(4):
+            yield f"data: tick {index}\n\n"
+            await asyncio.sleep(1)
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
 @app.get("/debug/search")
 async def debug_search(request: Request, q: str = ""):
     """Numbers behind the ranking, for tuning and for the chat tool."""
@@ -859,8 +872,15 @@ async def call_model(env, messages: list[dict], model: str, session: str, tools=
     return {"content": content, "tool_calls": calls}
 
 
-async def agent_answer(env, question: str, session: str) -> tuple[str, list[dict], str, str, list[dict]]:
+async def agent_answer(
+    env, question: str, session: str, emit=None
+) -> tuple[str, list[dict], str, str, list[dict]]:
     """Tool loop: the model chooses search, vector search, SQL or a single post lookup."""
+
+    async def say(kind: str, text: str) -> None:
+        if emit is not None:
+            await emit(kind, {"text": text})
+
     registry: dict[str, dict] = {}
     trace: list[dict] = []
     messages = [
@@ -868,6 +888,7 @@ async def agent_answer(env, question: str, session: str) -> tuple[str, list[dict
         {"role": "user", "content": question},
     ]
 
+    await say("status", "Searching your bookmarks...")
     model = CHAT_MODEL
     for attempt in range(2):
         try:
@@ -885,6 +906,7 @@ async def agent_answer(env, question: str, session: str) -> tuple[str, list[dict
                             args = json.loads((call.get("function") or {}).get("arguments") or "{}")
                         except json.JSONDecodeError:
                             args = {}
+                        await say("tool", f"Running {name}...")
                         try:
                             result = await run_tool(env, name, args, registry)
                         except Exception as error:  # noqa: BLE001 - report the tool error to the model
@@ -1026,16 +1048,120 @@ async def chat_send(request: Request):
         ]
     )
 
-    return await render(
-        request,
-        "partials/messages.html",
-        {
-            "messages": [
-                {"role": "user", "content": question, "sources": []},
-                {"role": "assistant", "content": answer, "sources": slim, "model": model, "trace": trace},
-            ]
-        },
+    # No-JS fallback: store the answer, then load the page normally.
+    return RedirectResponse(f"/chat?c={conversation['id']}", status_code=303)
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request):
+    """Same loop as /chat, but the browser sees progress as it happens (Server-Sent Events)."""
+    env = env_of(request)
+    db = env.DB
+    form = parse_qs((await request.body()).decode("utf-8", "replace"))
+    question = (form.get("message") or [""])[0].strip()
+    conversation_id = (form.get("conversation") or [""])[0].strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    conversation = None
+    if conversation_id:
+        conversation = await fetch_one(db, "SELECT id, title FROM conversations WHERE id = ?", (conversation_id,))
+    if conversation is None:
+        conversation = await create_conversation(db, question[:60])
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    statements = [
+        db.prepare(
+            "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, 'user', ?, ?)"
+        ).bind(conversation["id"], question, now)
+    ]
+    if (conversation.get("title") or "New chat") == "New chat":
+        statements.append(
+            db.prepare("UPDATE conversations SET title = ? WHERE id = ?").bind(question[:60], conversation["id"])
+        )
+    await db.batch(statements)
+
+    async def events():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def emit(kind: str, payload: dict) -> None:
+            await queue.put({"kind": kind, "payload": payload})
+
+        async def work() -> None:
+            try:
+                answer, sources, used, model, trace = await agent_answer(
+                    env, question, f"tb-{conversation['id']}", emit
+                )
+                slim_all = [
+                    {
+                        "id": row["id"],
+                        "n": row.get("n"),
+                        "handle": row.get("handle"),
+                        "url": row.get("url"),
+                        "posted_at": row.get("posted_at"),
+                    }
+                    for row in sources
+                ]
+                cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
+                slim = [source for source in slim_all if cited and source.get("n") in cited] or slim_all
+
+                await db.batch(
+                    [
+                        db.prepare(
+                            "INSERT INTO messages (conversation_id, role, content, sources, model, tool_trace, created_at) "
+                            "VALUES (?, 'assistant', ?, ?, ?, ?, ?)"
+                        ).bind(conversation["id"], answer, json.dumps(slim), model, json.dumps(trace), now),
+                        db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").bind(now, conversation["id"]),
+                    ]
+                )
+                fragment = await render(
+                    request,
+                    "partials/messages.html",
+                    {
+                        "messages": [
+                            {"role": "user", "content": question, "sources": []},
+                            {
+                                "role": "assistant",
+                                "content": answer,
+                                "sources": slim,
+                                "model": model,
+                                "trace": trace,
+                            },
+                        ]
+                    },
+                )
+                await emit("answer", {"html": fragment.body.decode("utf-8", "replace")})
+            except Exception as error:  # noqa: BLE001 - report to the browser, never hang it
+                await emit("error", {"text": f"Something failed: {str(error)[:200]}"})
+            finally:
+                await queue.put({"kind": "done", "payload": None})
+
+        task = asyncio.create_task(work())
+        yield "retry: 2000\n\n"
+        while True:
+            item = await queue.get()
+            if item["kind"] == "done":
+                break
+            yield f"event: {item['kind']}\ndata: {json.dumps(item['payload'])}\n\n"
+        await task
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
     )
+
+
+@app.post("/chat/{conversation_id}/delete")
+async def chat_delete(request: Request, conversation_id: str):
+    db = env_of(request).DB
+    await db.batch(
+        [
+            db.prepare("DELETE FROM messages WHERE conversation_id = ?").bind(conversation_id),
+            db.prepare("DELETE FROM conversations WHERE id = ?").bind(conversation_id),
+        ]
+    )
+    return RedirectResponse("/chat", status_code=303)
 
 
 @app.get("/{path:path}")

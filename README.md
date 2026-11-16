@@ -65,7 +65,9 @@ PATH="$PWD/.venv/bin:$PATH" uv run pywrangler dev
 | `POST` | `/ingest` | Batch upsert, max 25 posts, `Authorization: Bearer $INGEST_TOKEN`, returns `{stored, new}` |
 | `GET` | `/health` | Post, FTS row and pending-embedding counts |
 | `GET` | `/chat` | Chat page; `?c=<id>` loads a session, `?new=1` starts one |
-| `POST` | `/chat` | Ask a question; returns the user and assistant messages |
+| `POST` | `/chat` | No-JS path: answers, stores, then redirects to the conversation |
+| `POST` | `/chat/stream` | Same loop, as Server-Sent Events: `status`, `tool`, `answer`, `error` |
+| `POST` | `/chat/{id}/delete` | Delete a conversation and its messages |
 | `POST` | `/reindex` | Embed posts where `embedded_at IS NULL` |
 | `GET` | `/debug/search?q=` | BM25, cosine and fused scores, for tuning |
 
@@ -131,6 +133,10 @@ and only cited posts appear as chips. Each stored message keeps `tool_trace` so 
 
 `sql_query` is guarded: one statement, `SELECT`/`WITH` only, a blocklist of write and pragma verbs, 50 rows,
 300 characters per field, `raw` stripped.
+
+The page streams progress over SSE: `status` → `tool` (one per call) → `answer`. The browser appends the user
+bubble and a pending assistant bubble, then replaces the pending one with the returned HTML. Chats can be
+deleted from the sidebar (hover a title, press ×).
 
 Sessions live in D1: `conversations` and `messages` (role, content, sources JSON, model). A new chat is named
 after its first question.
