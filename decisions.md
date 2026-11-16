@@ -378,3 +378,53 @@ Consequence: the app is unusable from any new browser or device until the hash i
 
 This is the second time a secret upload has silently broken login (see the empty-hash incident). A
 post-deploy login smoke test belongs in the same script as the routing eval.
+
+---
+
+## D19 — SQL rows cannot become citations; the chips come from search only — open, fix next session
+
+The user's report: "pulling from the SQLite db should be able to provide the link directly or in citations.
+Currently the citations are automatically becoming the ones pulled from vector search."
+
+**Confirmed in the code.** There is one source registry per answer:
+
+- `register()` (line 781) assigns each post a stable `n` and stores `{id, handle, url, posted_at, n}`.
+- `register()` is called from exactly two places: `tool_search` (817) and `tool_get` (867).
+- `tool_sql` returns rows that do contain `id` and `url`, but it never calls `register()`, so those rows have
+  no `n` and never enter the registry.
+- The answer's chips are `list(registry.values())` — hence search results and nothing else.
+
+**Two failure shapes, both already visible in the D17 eval run:**
+
+1. *No chip at all.* The Ben Dicken answer had to print a bare post id (`SIMD [2122190200856338542]`) because
+   the model had no `n` to cite. The UI rendered no source for it.
+2. *A wrong chip.* The November count answer cited `[1]` while the registry was empty: `[1]` points at
+   nothing, and the number is meaningless to the reader.
+
+**A third, separate bug makes it look worse.** Both call sites compute
+
+```python
+slim = [source for source in slim_all if cited and source.get("n") in cited] or slim_all
+```
+
+(`/chat` ~line 1119, `/chat/stream` ~line 1214). The `or slim_all` fallback means an answer that cites
+*nothing* still shows **every** post the tools touched, uncited. With `vector_search` in the trace, that is a
+list of nearest neighbours presented as sources — exactly what "citations automatically become the ones
+pulled from vector search" describes. `citable: false` from D17 does not help here, because the fallback
+ignores it.
+
+**Fix direction (not yet applied):**
+
+1. `register()` the rows that `tool_sql` returns, so every row the model can see has a real `n` and a URL.
+2. Delete the `or slim_all` fallback. If the answer cites nothing, show nothing. An uncited row is not a source.
+3. Carry the per-row `authority` into the chip, so a chip can say whether it came from an exact query or is a
+   nearest neighbour. The registry entry already has room for one more field.
+4. Optional: let the model cite by `id` and have the renderer resolve it to a chip, instead of relying on the
+   model to reproduce the right `n`.
+
+**Scope.** No schema change and no migration. Touches `tool_sql`, the two `slim` blocks, and possibly
+`partials/messages.html` if a chip should show its authority. Small.
+
+**Why it matters beyond tidiness.** Every question that is answered best by SQL — counts, date ranges, author
+listings — is currently the class of question whose answer cannot carry a link. The strongest answers have the
+weakest citations.
