@@ -24,6 +24,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5 (
   post_id UNINDEXED,
   text,
   handle,
+  author,
   tokenize = 'unicode61 remove_diacritics 2'
 );
 

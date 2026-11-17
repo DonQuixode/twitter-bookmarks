@@ -367,12 +367,16 @@ def linkify(text) -> Markup:
 
 
 def fts_query(raw: str) -> str:
+    """Every token must match; the last one may be a prefix, so "ben" finds "benjdicken"."""
     words = []
     for token in (raw or "").replace('"', " ").split():
         clean = "".join(ch for ch in token if ch.isalnum() or ch in "_-")
         if clean:
-            words.append(f'"{clean}"')
-    return " ".join(words)
+            words.append(clean)
+    terms = [f'"{word}"' for word in words]
+    if words and len(words[-1]) >= 3:
+        terms[-1] = f'"{words[-1]}"*'
+    return " ".join(terms)
 
 
 async def lexical_search(db, query: str) -> list[dict]:
@@ -576,8 +580,11 @@ async def ingest(request: Request):
         )
         statements.append(db.prepare("DELETE FROM posts_fts WHERE post_id = ?").bind(post_id))
         statements.append(
-            db.prepare("INSERT INTO posts_fts (post_id, text, handle) VALUES (?, ?, ?)").bind(
-                post_id, post.get("text") or "", post.get("handle") or ""
+            db.prepare("INSERT INTO posts_fts (post_id, text, handle, author) VALUES (?, ?, ?, ?)").bind(
+                post_id,
+                post.get("text") or "",
+                post.get("handle") or "",
+                post.get("author") or "",
             )
         )
 
@@ -677,7 +684,11 @@ SYSTEM_PROMPT = (
     "4. Never invent a post, a link, a number or an id.\n"
     "5. If the tools return nothing useful, say so in one line and name a better search phrase.\n"
     "6. Be short: three sentences at most, then the citations.\n"
-    "7. No markdown headings and no separate citations or sources list: the interface already shows the posts."
+    "7. No markdown headings and no separate citations or sources list: the interface already shows the posts.\n"
+    "8. Earlier turns are real history. If the user names a person, or points back at a person already named,\n"
+    "   pass author= to search_bookmarks, or filter by author in SQL. Do not search a bare first name.\n"
+    "9. A follow-up refers to the conversation, not just to this sentence. Resolve it against the earlier turns\n"
+    "   before you choose a tool."
 )
 
 TOOL_SCHEMAS = [
@@ -690,6 +701,10 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Words or a natural-language description"},
+                    "author": {
+                        "type": "string",
+                        "description": "Optional. Restrict to one person: handle (@name) or display name.",
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Default 6"},
                 },
                 "required": ["query"],
@@ -723,7 +738,7 @@ TOOL_SCHEMAS = [
                 "Schema:\n"
                 "posts(id TEXT PRIMARY KEY, url TEXT, handle TEXT, author TEXT, text TEXT, posted_at TEXT ISO, "
                 "first_seen_at TEXT ISO, gone INTEGER, embedded_at TEXT, raw TEXT)\n"
-                "posts_fts(post_id UNINDEXED, text, handle) -- FTS5 virtual table, join on posts.id = posts_fts.post_id\n"
+                "posts_fts(post_id UNINDEXED, text, handle, author) -- FTS5 virtual table, join on posts.id = posts_fts.post_id\n"
                 "conversations(id TEXT, title TEXT, created_at TEXT, updated_at TEXT)\n"
                 "messages(id INTEGER, conversation_id TEXT, role TEXT, content TEXT, sources TEXT, model TEXT, tool_trace TEXT, created_at TEXT)"
             ),
@@ -816,16 +831,48 @@ def register(rows: list[dict], registry: dict, limit: int = 6) -> list[dict]:
     return out
 
 
+def matches_author(row: dict, author: str) -> bool:
+    """Case-insensitive match on the handle or the display name."""
+    wanted = author.lower().lstrip("@")
+    handle = str(row.get("handle") or "").lower().lstrip("@")
+    name = str(row.get("author") or "").lower()
+    return bool(wanted) and (wanted in handle or wanted in name)
+
+
+async def posts_by_author(db, author: str, limit: int = 20) -> list[dict]:
+    """The direct route: a person's posts, newest first, without guessing at keywords."""
+    like = f"%{author.lstrip('@')}%"
+    return await fetch_all(
+        db,
+        """SELECT id, handle, author, text, url, posted_at FROM posts
+           WHERE handle LIKE ? OR author LIKE ?
+           ORDER BY posted_at DESC LIMIT ?""",
+        (like, like, limit),
+    )
+
+
 async def tool_search(env, args: dict, registry: dict, mode: str) -> dict:
     query = str(args.get("query") or "").strip()
-    if not query:
-        raise ValueError("query is required")
+    author = str(args.get("author") or "").strip()
+    if not query and not author:
+        raise ValueError("query or author is required")
     limit = min(int(args.get("limit") or 6), 20)
-    if mode == "vector":
+    if not query:
+        # "all posts by X" needs no keywords at all.
+        rows = await posts_by_author(env.DB, author, limit)
+        used = "author"
+    elif mode == "vector":
         rows = await vector_search(env, query)
         used = "vector"
     else:
         rows, used = await hybrid_search(env, query)
+    if author and query:
+        kept = [row for row in rows if matches_author(row, author)]
+        if not kept:
+            # The keyword hit other people; go straight to the person.
+            kept = await posts_by_author(env.DB, author, limit)
+            used = f"{used}+author"
+        rows = kept
     posts = register(rows, registry, limit)
     if mode == "vector":
         return {
@@ -961,8 +1008,69 @@ async def call_model(env, messages: list[dict], model: str, session: str, tools=
     return {"content": content, "tool_calls": calls}
 
 
+HISTORY_CHAR_LIMIT = 200_000
+LEDGER_CALLS = 12
+
+
+def ledger_lines(traces: list[list[dict]], limit: int = LEDGER_CALLS) -> list[str]:
+    """One line per tool call from earlier turns: the call and its summary, never the payload."""
+    lines = []
+    for trace in traces:
+        for step in trace or []:
+            if step.get("tool") == "model":
+                continue
+            args = json.dumps(step.get("args") or {}, separators=(",", ":"))
+            lines.append(f"- {step.get('tool')} {args[:160]} -> {str(step.get('result'))[:120]}")
+    return lines[-limit:]
+
+
+def history_messages(rows: list[dict], limit: int = HISTORY_CHAR_LIMIT) -> list[dict]:
+    """All prior turns, text only. A runaway conversation keeps its newest messages."""
+    messages = [
+        {"role": row["role"], "content": row["content"]}
+        for row in rows
+        if row.get("content") and row.get("role") in ("user", "assistant")
+    ]
+    total = sum(len(message["content"]) for message in messages)
+    dropped = 0
+    while messages and total > limit:
+        total -= len(messages.pop(0)["content"])
+        dropped += 1
+    if dropped:
+        messages.insert(0, {"role": "user", "content": "(Earlier turns omitted: this chat is very long.)"})
+    return messages
+
+
+def build_prompt(ledger: list[str]) -> str:
+    if not ledger:
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT
+        + "\nEarlier tool calls in this conversation. Results are summarized, not reproduced:\n"
+        + "\n".join(ledger)
+        + "\nIf you need that data again, re-issue the call. To quote a post, call get_bookmark.\n"
+    )
+
+
+async def load_history(db, conversation_id: str) -> tuple[list[dict], list[str]]:
+    rows = await fetch_all(
+        db,
+        "SELECT role, content, tool_trace FROM messages WHERE conversation_id = ? ORDER BY id",
+        (conversation_id,),
+    )
+    traces = []
+    for row in rows:
+        if row.get("tool_trace"):
+            try:
+                traces.append(json.loads(row["tool_trace"]))
+            except json.JSONDecodeError:
+                continue
+    return history_messages(rows), ledger_lines(traces)
+
+
 async def agent_answer(
-    env, question: str, session: str, emit=None
+    env, question: str, session: str, emit=None, history: list[dict] | None = None,
+    ledger: list[str] | None = None,
 ) -> tuple[str, list[dict], str, str, list[dict]]:
     """Tool loop: the model chooses search, vector search, SQL or a single post lookup."""
 
@@ -972,10 +1080,9 @@ async def agent_answer(
 
     registry: dict[str, dict] = {}
     trace: list[dict] = []
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+    messages = [{"role": "system", "content": build_prompt(ledger or [])}]
+    messages.extend(history or [])
+    messages.append({"role": "user", "content": question})
 
     await say("status", "Searching your bookmarks...")
     model = CHAT_MODEL
@@ -1121,7 +1228,10 @@ async def chat_send(request: Request):
         )
     await db.batch(statements)
 
-    answer, sources, used, model, trace = await agent_answer(env, question, f"tb-{conversation['id']}")
+    history, ledger = await load_history(env.DB, conversation["id"])
+    answer, sources, used, model, trace = await agent_answer(
+        env, question, f"tb-{conversation['id']}", history=history, ledger=ledger
+    )
     slim_all = [
         {
             "id": row["id"],
@@ -1164,7 +1274,10 @@ async def eval_ask(request: Request):
     question = str(payload.get("question") or "").strip()
     if not question:
         return JSONResponse({"error": "question is required"}, status_code=400)
-    answer, sources, used, model, trace = await agent_answer(env, question, "tb-eval")
+    history = payload.get("history") or []
+    answer, sources, used, model, trace = await agent_answer(
+        env, question, "tb-eval", history=history, ledger=payload.get("ledger") or []
+    )
     # Same filtering the chat routes use, so a test sees the chips a reader would see.
     citations = cited_sources(sources, answer)
     return {
@@ -1217,8 +1330,9 @@ async def chat_stream(request: Request):
         async def work() -> None:
             try:
                 await emit("start", {"conversation": conversation["id"]})
+                history, ledger = await load_history(env.DB, conversation["id"])
                 answer, sources, used, model, trace = await agent_answer(
-                    env, question, f"tb-{conversation['id']}", emit
+                    env, question, f"tb-{conversation['id']}", emit, history=history, ledger=ledger
                 )
                 slim_all = [
                     {

@@ -27,8 +27,19 @@ TOKEN_FILE = pathlib.Path(
 )
 CASE_TIMEOUT = 180
 SEARCH_TOOLS = {"search_bookmarks", "vector_search"}
+AUTHOR = "benjdicken"
 
 CASES = [
+    {
+        "name": "follow-up keeps the person",
+        "turns": ["who do I bookmark most?", "show me all posts of ben"],
+        "expect": [],
+        "stop_after": None,
+        "answer_has": [],
+        "min_citations": 7,
+        "only_handle": AUTHOR,
+        "forbid": ["vector_search"],
+    },
     {
         "name": "exact author listing",
         "question": "can you give me all posts by Ben Dicken?",
@@ -70,8 +81,8 @@ CASES = [
 ]
 
 
-def ask(token: str, question: str) -> dict:
-    body = json.dumps({"question": question}).encode()
+def ask(token: str, question: str, history=None, ledger=None) -> dict:
+    body = json.dumps({"question": question, "history": history or [], "ledger": ledger or []}).encode()
     request = urllib.request.Request(
         f"{BASE}/eval/ask",
         data=body,
@@ -105,6 +116,10 @@ def check(case: dict, result: dict) -> list[str]:
         if name not in tools:
             problems.append(f"expected {name}, ran {tools or 'no tools'}")
 
+    for name in case.get("forbid") or []:
+        if name in tools:
+            problems.append(f"{name} must not run here")
+
     stop = case["stop_after"]
     if stop and stop in tools:
         after = tools[tools.index(stop) + 1 :]
@@ -123,9 +138,12 @@ def check(case: dict, result: dict) -> list[str]:
     wanted = case.get("min_citations", 0)
     if len(citations) < wanted:
         problems.append(f"expected >= {wanted} citations, got {len(citations)}")
+    only = case.get("only_handle")
     for row in citations:
         if not row.get("url"):
             problems.append(f"citation [{row.get('n')}] has no url")
+        if only and only not in str(row.get("handle") or "").lower():
+            problems.append(f"citation [{row.get('n')}] is @{row.get('handle')}, expected @{only}")
     if citations:
         numbers = sorted(row.get("n") for row in citations if row.get("n"))
         if numbers != list(range(1, len(numbers) + 1)):
@@ -144,12 +162,27 @@ def main() -> int:
     failures = 0
     for case in CASES:
         started = time.monotonic()
-        result = ask(token, case["question"])
+        turns = case.get("turns") or [case["question"]]
+        history, ledger, result = [], [], {}
+        for question in turns:
+            result = ask(token, question, history, ledger)
+            if result.get("error"):
+                break
+            history += [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": result.get("answer") or ""},
+            ]
+            ledger += [
+                f"- {step.get('tool')} {step.get('args')} -> {step.get('result')}"
+                for step in result.get("tools") or []
+                if step.get("tool") != "model"
+            ]
         problems = check(case, result)
         took = time.monotonic() - started
         tools = " -> ".join(step.get("tool", "?") for step in result.get("tools") or []) or "none"
         print(f"[{'pass' if not problems else 'FAIL'}] {case['name']}  ({took:.0f}s)")
-        print(f"       q:     {case['question']}")
+        for question in turns:
+            print(f"       q:     {question}")
         print(f"       tools: {tools}")
         for step in result.get("tools") or []:
             print(f"              {step.get('tool')}: {str(step.get('result'))[:90]}")
