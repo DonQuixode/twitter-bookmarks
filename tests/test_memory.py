@@ -114,3 +114,22 @@ def test_prompt_carries_the_ledger_and_the_honesty_rule():
     assert built.startswith("BASE")
     assert "summarized, not reproduced" in built
     assert "re-issue the call" in built
+
+
+def test_text_view_reports_whether_more_remains():
+    view = load("text_view", extra={"FULL_TEXT_CHARS": 10})
+    assert view("a" * 25) == ("a" * 10, True, 25)
+    piece, more, _ = view("a" * 25, 12)
+    assert piece == "a" * 10 and more is True
+    piece, more, _ = view("a" * 25, 20)
+    assert piece == "a" * 5 and more is False
+    assert view("short") == ("short", False, 5)
+
+
+def test_register_marks_a_cut_preview():
+    register = load("register", extra={"PREVIEW_CHARS": 500})
+    long_row = {"id": "1", "handle": "h", "text": "x" * 600, "url": "u"}
+    item = register([long_row], {}, 6)[0]
+    assert item["text_truncated"] is True and len(item["text"]) == 500
+    short = register([{"id": "2", "handle": "h", "text": "x" * 100}], {}, 6)[0]
+    assert short["text_truncated"] is False

@@ -55,6 +55,9 @@ CHAT_MODEL = "deepseek-v4.1-flash"
 CHAT_FALLBACK = "glm-5.3"
 CHUNK_CHARS = 1000
 CHUNK_OVERLAP = 200
+PREVIEW_CHARS = 500
+# One tool message is JSON-capped; this leaves room for the wrapper and escaping.
+FULL_TEXT_CHARS = 8000
 VECTOR_TOP_K = 30
 
 _login_failures: list[float] = []
@@ -683,7 +686,8 @@ SYSTEM_PROMPT = (
     "3. Answer only from tool output. Every claim carries the post number in square brackets, like [2].\n"
     "4. Never invent a post, a link, a number or an id.\n"
     "5. If the tools return nothing useful, say so in one line and name a better search phrase.\n"
-    "6. Be short: three sentences at most, then the citations.\n"
+    "6. Be short: three sentences at most, then the citations. If the user asks for a post's full text,\n"
+    "   quote it: fetch it with get_bookmark full=true and reproduce it without cutting it.\n"
     "7. No markdown headings and no separate citations or sources list: the interface already shows the posts.\n"
     "8. Earlier turns are real history. If the user names a person, or points back at a person already named,\n"
     "   pass author= to search_bookmarks, or filter by author in SQL. Do not search a bare first name.\n"
@@ -734,7 +738,9 @@ TOOL_SCHEMAS = [
                 "Run ONE read-only SQLite statement (SELECT or WITH only) against the bookmarks database. "
                 "Use it for counts, dates, filters and grouping. Returns at most 50 rows. Never select raw. "
                 "Include id, handle, url and posted_at in the SELECT when the rows are posts that you will "
-                "cite: those rows come back with an [n] you can use. Aggregate rows get no [n].\n"
+                "cite: those rows come back with an [n] you can use. Aggregate rows get no [n]. "
+                "String fields are cut at 300 characters: call get_bookmark with full=true for the whole "
+                "text of a post.\n"
                 "Schema:\n"
                 "posts(id TEXT PRIMARY KEY, url TEXT, handle TEXT, author TEXT, text TEXT, posted_at TEXT ISO, "
                 "first_seen_at TEXT ISO, gone INTEGER, embedded_at TEXT, raw TEXT)\n"
@@ -753,10 +759,24 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_bookmark",
-            "description": "Fetch one bookmark in full by its post id.",
+            "description": (
+                "Fetch one bookmark by its post id. By default you get the first 500 characters; "
+                "pass full=true when the user wants the whole post or you must quote beyond the preview."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"id": {"type": "string", "description": "Post id, as seen in search results"}},
+                "properties": {
+                    "id": {"type": "string", "description": "Post id, as seen in search results"},
+                    "full": {
+                        "type": "boolean",
+                        "description": "Return the whole stored text instead of the 500-character preview.",
+                    },
+                    "from_char": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "With full=true, start at this character. Use it to continue a long post.",
+                    },
+                },
                 "required": ["id"],
             },
         },
@@ -819,16 +839,27 @@ def register(rows: list[dict], registry: dict, limit: int = 6) -> list[dict]:
                 "n": len(registry) + 1,
             }
         item = registry[post_id]
+        text = row.get("text") or ""
         out.append(
             {
                 "n": item["n"],
                 "id": post_id,
                 "handle": row.get("handle"),
                 "posted_at": row.get("posted_at"),
-                "text": (row.get("text") or "")[:500],
+                "text": text[:PREVIEW_CHARS],
+                # Tell the model the truth: there is more of this post.
+                "text_truncated": len(text) > PREVIEW_CHARS,
             }
         )
     return out
+
+
+def text_view(text: str, from_char: int = 0, limit: int = FULL_TEXT_CHARS) -> tuple[str, bool, int]:
+    """A window of the text, whether more remains, and the total length."""
+    total = len(text or "")
+    piece = (text or "")[from_char : from_char + limit]
+    more = from_char + len(piece) < total
+    return piece, more, total
 
 
 def matches_author(row: dict, author: str) -> bool:
@@ -922,6 +953,8 @@ async def tool_get(env, args: dict, registry: dict) -> dict:
     post_id = str(args.get("id") or "").strip()
     if not post_id:
         raise ValueError("id is required")
+    full = bool(args.get("full"))
+    from_char = max(0, int(args.get("from_char") or 0))
     row = await fetch_one(
         env.DB,
         "SELECT id, url, handle, author, text, posted_at, first_seen_at FROM posts WHERE id = ?",
@@ -930,13 +963,37 @@ async def tool_get(env, args: dict, registry: dict) -> dict:
     if not row:
         return {"found": False, "id": post_id}
     item = register([row], registry, 1)[0]
+    text = row.get("text") or ""
+    if full:
+        piece, more, total = text_view(text, from_char)
+        note = (
+            f"Characters {from_char + 1}-{from_char + len(piece)} of {total}. "
+            f"Call again with from_char={from_char + len(piece)} for the rest."
+            if more
+            else f"The whole stored text of this post ({total} characters)."
+        )
+    else:
+        piece, more, total = item["text"], len(text) > PREVIEW_CHARS, len(text)
+        note = (
+            "The first 500 characters. Call again with full=true for the whole text."
+            if more
+            else f"The whole stored text of this post ({total} characters)."
+        )
     return {
         "found": True,
-        "post": {**item, "author": row.get("author"), "url": row.get("url")},
+        "post": {
+            **item,
+            "author": row.get("author"),
+            "url": row.get("url"),
+            "text": piece,
+            "text_truncated": more,
+            "text_chars_total": total,
+        },
         "authority": "exact",
-        "complete": True,
+        # complete means: nothing of this post is still unread. A preview is not complete.
+        "complete": not more,
         "citable": True,
-        "note": "The full stored text of this post.",
+        "note": note,
     }
 
 
@@ -961,7 +1018,10 @@ def preview(result) -> str:
         if "row_count" in result:
             return f"{result['row_count']} rows ({authority}, {complete})"
         if "found" in result:
-            return "found" if result["found"] else "not found"
+            if not result["found"]:
+                return "not found"
+            post = result.get("post") or {}
+            return "partial text" if post.get("text_truncated") else "full text"
         if "error" in result:
             return f"error: {str(result['error'])[:120]}"
     return str(result)[:120]
@@ -973,7 +1033,7 @@ async def call_model(env, messages: list[dict], model: str, session: str, tools=
     if not key:
         raise RuntimeError("GO_API_KEY is not set")
 
-    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 1100}
+    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 2500}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -1113,7 +1173,7 @@ async def agent_answer(
                                 "role": "tool",
                                 "tool_call_id": call.get("id"),
                                 "name": name,
-                                "content": json.dumps(result)[:6000],
+                                "content": json.dumps(result)[:12000],
                             }
                         )
                     continue

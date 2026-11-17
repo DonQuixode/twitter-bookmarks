@@ -31,6 +31,15 @@ AUTHOR = "benjdicken"
 
 CASES = [
     {
+        "name": "full text on request",
+        "question": "Read me the full text of the LRU cache debugging post by @GonnabeNikhil.",
+        "expect": [],
+        "answer_has": ["lru"],
+        "min_citations": 1,
+        "min_answer_chars": 1500,
+        "require": [{"tool": "get_bookmark", "arg": "full"}],
+    },
+    {
         "name": "follow-up keeps the person",
         "turns": ["who do I bookmark most?", "show me all posts of ben"],
         "expect": [],
@@ -116,11 +125,18 @@ def check(case: dict, result: dict) -> list[str]:
         if name not in tools:
             problems.append(f"expected {name}, ran {tools or 'no tools'}")
 
+    for want in case.get("require") or []:
+        if not any(
+            step.get("tool") == want["tool"] and (step.get("args") or {}).get(want["arg"])
+            for step in result.get("tools") or []
+        ):
+            problems.append(f"expected {want['tool']} with {want['arg']}=true")
+
     for name in case.get("forbid") or []:
         if name in tools:
             problems.append(f"{name} must not run here")
 
-    stop = case["stop_after"]
+    stop = case.get("stop_after")
     if stop and stop in tools:
         after = tools[tools.index(stop) + 1 :]
         leaked = [name for name in after if name in SEARCH_TOOLS]
@@ -128,6 +144,8 @@ def check(case: dict, result: dict) -> list[str]:
             problems.append(f"searched again after exact {stop}: {leaked}")
 
     answer = (result.get("answer") or "").lower()
+    if len(answer) < int(case.get("min_answer_chars") or 0):
+        problems.append(f"answer is only {len(answer)} characters")
     for needle in case["answer_has"]:
         if needle.lower() not in answer:
             problems.append(f"answer lacks '{needle}'")

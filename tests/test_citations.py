@@ -35,6 +35,11 @@ def load(name: str):
         "list": list,
         "dict": dict,
     }
+    # Module constants the extracted functions read at call time.
+    for constant in ("PREVIEW_CHARS", "FULL_TEXT_CHARS", "LEDGER_CALLS", "HISTORY_CHAR_LIMIT"):
+        found = re.search(rf"^{constant} = (\d+)", SOURCE, re.MULTILINE)
+        if found:
+            namespace[constant] = int(found.group(1))
     exec(compile(body, "main.py", "exec"), namespace)
     return namespace[name]
 
