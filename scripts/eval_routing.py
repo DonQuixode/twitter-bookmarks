@@ -35,6 +35,7 @@ CASES = [
         "expect": ["sql_query"],
         "stop_after": "sql_query",
         "answer_has": ["7"],
+        "min_citations": 7,
     },
     {
         "name": "count by month",
@@ -44,11 +45,20 @@ CASES = [
         "answer_has": [],
     },
     {
+        "name": "sql answer carries links",
+        "question": "show me the three most recent posts I saved, with links",
+        "expect": ["sql_query"],
+        "stop_after": "sql_query",
+        "answer_has": [],
+        "min_citations": 3,
+    },
+    {
         "name": "read one known post",
         "question": "what does the Varnan hiring post say?",
         "expect": [],
         "stop_after": None,
         "answer_has": ["varnan"],
+        "min_citations": 1,
     },
     {
         "name": "absence is allowed",
@@ -108,6 +118,18 @@ def check(case: dict, result: dict) -> list[str]:
             problems.append(f"answer lacks '{needle}'")
     if not answer:
         problems.append("empty answer")
+
+    citations = result.get("citations") or []
+    wanted = case.get("min_citations", 0)
+    if len(citations) < wanted:
+        problems.append(f"expected >= {wanted} citations, got {len(citations)}")
+    for row in citations:
+        if not row.get("url"):
+            problems.append(f"citation [{row.get('n')}] has no url")
+    if citations:
+        numbers = sorted(row.get("n") for row in citations if row.get("n"))
+        if numbers != list(range(1, len(numbers) + 1)):
+            problems.append(f"citation numbers are not 1..n: {numbers}")
     return problems
 
 
@@ -133,6 +155,8 @@ def main() -> int:
             print(f"              {step.get('tool')}: {str(step.get('result'))[:90]}")
         if result.get("answer"):
             print(f"       a:     {result['answer'][:150]}")
+        chips = result.get("citations") or []
+        print(f"       chips: {len(chips)}" + (f" -> {[row.get('n') for row in chips]}" if chips else ""))
         for problem in problems:
             print(f"       ! {problem}")
         print()

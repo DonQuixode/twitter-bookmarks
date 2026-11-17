@@ -717,7 +717,9 @@ TOOL_SCHEMAS = [
             "name": "sql_query",
             "description": (
                 "Run ONE read-only SQLite statement (SELECT or WITH only) against the bookmarks database. "
-                "Use it for counts, dates, filters and grouping. Returns at most 50 rows. Never select raw.\n"
+                "Use it for counts, dates, filters and grouping. Returns at most 50 rows. Never select raw. "
+                "Include id, handle, url and posted_at in the SELECT when the rows are posts that you will "
+                "cite: those rows come back with an [n] you can use. Aggregate rows get no [n].\n"
                 "Schema:\n"
                 "posts(id TEXT PRIMARY KEY, url TEXT, handle TEXT, author TEXT, text TEXT, posted_at TEXT ISO, "
                 "first_seen_at TEXT ISO, gone INTEGER, embedded_at TEXT, raw TEXT)\n"
@@ -778,16 +780,26 @@ def trim_row(row: dict, limit: int = 300) -> dict:
     return out
 
 
+def cited_sources(sources: list[dict], answer: str) -> list[dict]:
+    """Only what the answer cites. No fallback: a row the answer did not use is not a source."""
+    cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
+    return [source for source in sources if source.get("n") in cited]
+
+
 def register(rows: list[dict], registry: dict, limit: int = 6) -> list[dict]:
     """Give every post one stable number, so the model's [n] matches the UI chips."""
     out = []
     for row in rows[:limit]:
-        post_id = row["id"]
+        raw_id = row.get("id")
+        if raw_id is None or str(raw_id) == "":
+            continue  # an aggregate row is not a post and cannot be cited
+        post_id = str(raw_id)
         if post_id not in registry:
             registry[post_id] = {
                 "id": post_id,
                 "handle": row.get("handle"),
-                "url": row.get("url"),
+                # A SQL projection may omit url; the canonical form always works.
+                "url": row.get("url") or f"https://x.com/i/web/status/{post_id}",
                 "posted_at": row.get("posted_at"),
                 "n": len(registry) + 1,
             }
@@ -837,11 +849,17 @@ async def tool_search(env, args: dict, registry: dict, mode: str) -> dict:
     }
 
 
-async def tool_sql(env, args: dict) -> dict:
+async def tool_sql(env, args: dict, registry: dict) -> dict:
     statement = sql_guard(str(args.get("sql") or ""))
     rows = await fetch_all(env.DB, statement)
     trimmed = [trim_row(row) for row in rows[:50]]
     truncated = len(rows) > 50
+    # Rows that are posts get the same stable [n] as search hits, so the answer can link them.
+    registered = {item["id"]: item["n"] for item in register(trimmed, registry, 50)}
+    for row in trimmed:
+        number = registered.get(str(row.get("id")))
+        if number is not None:
+            row["n"] = number
     return {
         "row_count": len(rows),
         "rows": trimmed,
@@ -881,7 +899,7 @@ async def run_tool(env, name: str, args: dict, registry: dict) -> dict:
     if name == "vector_search":
         return await tool_search(env, args, registry, "vector")
     if name == "sql_query":
-        return await tool_sql(env, args)
+        return await tool_sql(env, args, registry)
     if name == "get_bookmark":
         return await tool_get(env, args, registry)
     raise ValueError(f"unknown tool: {name}")
@@ -1114,9 +1132,7 @@ async def chat_send(request: Request):
         }
         for row in sources
     ]
-    # Keep only what the answer cites; if it cites nothing, keep everything it saw.
-    cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
-    slim = [source for source in slim_all if cited and source.get("n") in cited] or slim_all
+    slim = cited_sources(slim_all, answer)
 
     await db.batch(
         [
@@ -1149,12 +1165,17 @@ async def eval_ask(request: Request):
     if not question:
         return JSONResponse({"error": "question is required"}, status_code=400)
     answer, sources, used, model, trace = await agent_answer(env, question, "tb-eval")
+    # Same filtering the chat routes use, so a test sees the chips a reader would see.
+    citations = cited_sources(sources, answer)
     return {
         "answer": answer,
         "model": model,
         "used": used,
         "tools": trace,
         "sources": len(sources),
+        "citations": [
+            {"n": row.get("n"), "handle": row.get("handle"), "url": row.get("url")} for row in citations
+        ],
     }
 
 
@@ -1209,8 +1230,7 @@ async def chat_stream(request: Request):
                     }
                     for row in sources
                 ]
-                cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
-                slim = [source for source in slim_all if cited and source.get("n") in cited] or slim_all
+                slim = cited_sources(slim_all, answer)
 
                 await db.batch(
                     [
