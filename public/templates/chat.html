@@ -2,7 +2,8 @@
 {% block subtitle %}chat over your bookmarks{% endblock %}
 {% block content %}
   <div class="chat">
-    <aside class="convs">
+    <div class="scrim" aria-hidden="true"></div>
+    <aside class="convs" id="convs">
       <a class="new" href="/chat?new=1">+ New chat</a>
       {% for item in conversations %}
         <div class="conv {{ 'active' if item.id == conversation.id else '' }}">
@@ -15,6 +16,10 @@
     </aside>
 
     <section class="thread">
+      <div class="mobilebar">
+        <button class="menu" type="button" aria-controls="convs" aria-expanded="false" aria-label="Show chats">☰</button>
+        <span class="title">{{ conversation.title }}</span>
+      </div>
       <div id="messages">
         {% if not messages %}
           <p class="empty">Ask about anything you saved. Answers cite the bookmarks they use.</p>
@@ -40,6 +45,24 @@
     });
 
     const list = document.getElementById("messages");
+
+    // Phone: the conversation list is a drawer. Escape and the scrim close it.
+    const chat = document.querySelector(".chat");
+    const menu = document.querySelector(".menu");
+    if (chat && menu) {
+      const close = () => {
+        chat.classList.remove("drawer-open");
+        menu.setAttribute("aria-expanded", "false");
+      };
+      menu.addEventListener("click", () => {
+        const open = chat.classList.toggle("drawer-open");
+        menu.setAttribute("aria-expanded", String(open));
+      });
+      document.querySelector(".scrim").addEventListener("click", close);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") close();
+      });
+    }
 
     composer.addEventListener("submit", async (event) => {
       event.preventDefault();

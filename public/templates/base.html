@@ -61,7 +61,26 @@
       .trace ul { margin: 6px 0 0; padding-left: 18px; }
       .htmx-indicator { display: none; }
       .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline; }
-      @media (max-width: 640px) { .chat { grid-template-columns: 1fr; } .convs { display: none; } }
+
+      /* phone: the conversation list is a drawer, not a hidden column */
+      .mobilebar { display: none; }
+      .scrim { display: none; }
+      @media (max-width: 640px) {
+        .chat { grid-template-columns: 1fr; }
+        .mobilebar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+        .mobilebar .menu { padding: 5px 10px; font-size: 16px; line-height: 1; }
+        .mobilebar .title { font-size: 14px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .convs {
+          position: fixed; top: 0; bottom: 0; left: 0; width: min(78vw, 300px);
+          z-index: 30; background: var(--bg); border-right: 1px solid var(--line);
+          margin: 0; padding: 14px 12px; overflow-y: auto;
+          transform: translateX(-102%); visibility: hidden;
+          transition: transform 0.22s ease, visibility 0s linear 0.22s;
+        }
+        .chat.drawer-open .convs { transform: none; visibility: visible; transition: transform 0.22s ease; }
+        .chat.drawer-open .scrim { display: block; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); z-index: 20; }
+      }
+      @media (prefers-reduced-motion: reduce) { .convs { transition: none; } }
     </style>
   </head>
   <body>
